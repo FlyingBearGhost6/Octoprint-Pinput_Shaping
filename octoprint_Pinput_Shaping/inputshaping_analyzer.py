@@ -1,12 +1,13 @@
 """Input Shaping Analyzer for OctoPrint Plugin Pinput_Shaping"""
 
+import json
 import logging
 import os
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.signal import butter, filtfilt, welch
+from scipy.signal import butter, filtfilt, welch, find_peaks
 
 MAX_BYTES_32 = 2_000_000_000  # ~ 2 gi b
 
@@ -19,7 +20,16 @@ class InputShapingAnalyzer:
     """
 
     def __init__(
-        self, save_dir, csv_path, damping=0.5, cutoff_freq=100, axis=None, logger=None
+        self,
+        save_dir,
+        csv_path,
+        damping=0.5,
+        cutoff_freq=100,
+        axis=None,
+        freq_min=10,
+        freq_max=200,
+        freq_window=8.0,
+        logger=None,
     ) -> None:
         """
         Initializes the InputShapingAnalyzer with the given parameters.
@@ -38,10 +48,14 @@ class InputShapingAnalyzer:
         self.csv_path = csv_path
         self.damping = damping
         self.cutoff_freq = cutoff_freq
-        self.axis = axis.upper()
+        self.axis = (axis or "X").upper()
+        self.freq_min = min(freq_min, freq_max)
+        self.freq_max = max(freq_min, freq_max)
+        self.freq_window = max(1.0, float(freq_window))
         self.result_dir = save_dir
         self.best_shaper = None
         self.base_freq = None
+        self.secondary_freqs = []
         self.shaper_results = {}
         self.time = None
         self.raw = None
@@ -49,6 +63,7 @@ class InputShapingAnalyzer:
         self.sampling_rate = None
         self.freqs = None
         self.psd = None
+        self._band_mask = None
 
     def load_data(self) -> None:
         """Loads the data from the CSV file and processes it."""
@@ -75,6 +90,35 @@ class InputShapingAnalyzer:
         self.raw = df[axis_col].to_numpy(dtype=np.float64)
 
         self.sampling_rate = 1.0 / np.mean(np.diff(self.time))
+
+    def _get_band_mask(self) -> np.ndarray:
+        """Return boolean mask for the user-requested frequency band."""
+
+        mask = (self.freqs >= self.freq_min) & (self.freqs <= self.freq_max)
+        if not np.any(mask):
+            self._plugin_logger.warning(
+                "Requested frequency band has no samples. Falling back to full spectrum."
+            )
+            mask = np.ones_like(self.freqs, dtype=bool)
+        return mask
+
+    def _detect_resonant_peaks(self, psd: np.ndarray, freqs: np.ndarray):
+        """Return a list of (frequency, amplitude) tuples ordered by prominence."""
+
+        if len(psd) == 0:
+            return []
+
+        prominence = float(np.max(psd)) * 0.05
+        peaks, _ = find_peaks(psd, prominence=prominence)
+
+        if peaks.size == 0:
+            idx = int(np.argmax(psd))
+            return [(float(freqs[idx]), float(psd[idx]))]
+
+        ordering = np.argsort(psd[peaks])[::-1]
+        return [
+            (float(freqs[peak_idx]), float(psd[peak_idx])) for peak_idx in peaks[ordering]
+        ]
 
     def lowpass_filter(self, data, order=4) -> np.ndarray:
         """Applies a low-pass Butterworth filter to the data.
@@ -180,6 +224,23 @@ class InputShapingAnalyzer:
                 shaped[shift:] += amp * signal[: n - shift]
         return shaped
 
+    def _shaper_frequency_response(self, shaper, freqs=None) -> np.ndarray:
+        """Compute the magnitude response of a shaper for the given frequency grid."""
+
+        if freqs is None:
+            freqs = self.freqs
+        if freqs is None or len(freqs) == 0:
+            return np.array([], dtype=np.float64)
+
+        delays = np.array([d for d, _ in shaper], dtype=np.float64)
+        amps = np.array([a for _, a in shaper], dtype=np.float64)
+        if delays.size == 0:
+            return np.ones_like(freqs)
+
+        exp_term = np.exp(-1j * 2 * np.pi * np.outer(freqs, delays))
+        response = exp_term @ amps
+        return np.abs(response)
+
     def compute_psd(self, signal: np.ndarray) -> tuple:
         """Computes the Power Spectral Density (PSD) of the signal using Welch's method.
         :param signal: The input signal to analyze.
@@ -218,23 +279,77 @@ class InputShapingAnalyzer:
             raise
         self.freqs, self.psd = self.compute_psd(self.filtered)
 
-        freq_range = (self.freqs > 20) & (self.freqs < 80)
-        self.base_freq = self.freqs[freq_range][np.argmax(self.psd[freq_range])]
+        self._band_mask = self._get_band_mask()
+        band_freqs = self.freqs[self._band_mask]
+        band_psd = self.psd[self._band_mask]
+
+        peaks = self._detect_resonant_peaks(band_psd, band_freqs)
+        if not peaks:
+            raise ValueError("No resonant peaks detected in the provided data.")
+
+        self.base_freq = peaks[0][0]
+        self.secondary_freqs = [p[0] for p in peaks[1:3]]
+
+        EPS = 1e-12
+        self.band_energy = float(np.trapz(band_psd, band_freqs))
+        self.band_energy = max(self.band_energy, EPS)
+
+        window_mask = (self.freqs >= self.base_freq - self.freq_window) & (
+            self.freqs <= self.base_freq + self.freq_window
+        )
+        if not np.any(window_mask):
+            window_mask = self._band_mask
+        self._window_mask = window_mask
+        window_psd = self.psd[self._window_mask]
+        self.window_freqs = self.freqs[self._window_mask]
+        self.window_energy = float(np.trapz(window_psd, self.window_freqs))
+        self.window_energy = max(self.window_energy, EPS)
+        self.original_peak = float(np.max(window_psd)) if window_psd.size else EPS
+
         shapers = self.generate_shapers(self.base_freq)
 
+        dt = np.mean(np.diff(self.time))
         for name, shaper in shapers.items():
             shaped = self.apply_shaper(self.filtered, self.time, shaper)
-            _, shaped_psd = self.compute_psd(shaped)
-            vibr = np.sum(shaped_psd)
-            accel = max(np.abs(np.gradient(shaped, np.mean(np.diff(self.time)))))
+            accel = max(np.abs(np.gradient(shaped, dt)))
+
+            response_mag = self._shaper_frequency_response(shaper)
+            if response_mag.size != self.freqs.size:
+                response_mag = np.resize(response_mag, self.freqs.size)
+
+            residual_psd = self.psd * (response_mag**2)
+            band_psd_shaped = residual_psd[self._band_mask]
+            window_psd_shaped = residual_psd[self._window_mask]
+
+            band_energy = float(np.trapz(band_psd_shaped, band_freqs))
+            band_energy = max(band_energy, EPS)
+            window_peak = (
+                float(np.max(window_psd_shaped))
+                if window_psd_shaped.size
+                else float(np.max(band_psd_shaped))
+            )
+
+            reduction_db = 10 * np.log10(self.band_energy / band_energy)
+            peak_reduction_db = 10 * np.log10(
+                (self.original_peak + EPS) / (window_peak + EPS)
+            )
+
             self.shaper_results[name] = {
-                "psd": shaped_psd,
-                "vibr": vibr,
+                "psd": residual_psd,
+                "vibr": band_energy,  # backwards compatibility
+                "residual_energy": band_energy,
+                "residual_ratio": band_energy / self.band_energy,
+                "reduction_db": reduction_db,
+                "peak_reduction_db": peak_reduction_db,
                 "accel": accel,
             }
 
-        self.best_shaper = min(
-            self.shaper_results, key=lambda s: self.shaper_results[s]["vibr"]
+        self.best_shaper = max(
+            self.shaper_results,
+            key=lambda s: (
+                self.shaper_results[s]["reduction_db"],
+                -self.shaper_results[s]["accel"],
+            ),
         )
         return self.best_shaper
 
@@ -280,7 +395,7 @@ class InputShapingAnalyzer:
         for name, result in self.shaper_results.items():
             label = (
                 f"{name} ({self.base_freq:.1f} Hz)  "
-                f"vibr={result['vibr']:.2e}  "
+                f"Δ={result['reduction_db']:.1f} dB  "
                 f"accel={result['accel']:.1f}"
             )
             ax.plot(
@@ -291,7 +406,9 @@ class InputShapingAnalyzer:
         ax.set_xlabel("Frequency (Hz)")
         ax.set_ylabel("Power Spectral Density (PSD)")
         ax.grid(True, linestyle="--", alpha=0.4)
-        ax.set_xlim(0, 200)
+        lower = max(0, self.freq_min - 10)
+        upper = max(self.freq_max * 1.1, self.base_freq * 1.2)
+        ax.set_xlim(lower, upper)
         ax.set_ylim(0, np.max(self.psd) * 1.1)
         ax.legend(loc="upper right", fontsize=8)
         # Adjust lower space
@@ -299,7 +416,7 @@ class InputShapingAnalyzer:
         # Recommended text
         recommendation_text = (
             f"Recommended: {self.best_shaper} ({self.base_freq:.1f} Hz)\n"
-            f"Marlin CMD: M593 F{self.base_freq:.1f} D{self.damping} S{self.best_shaper}"
+            f"Marlin CMD: M593 {self.axis} F{self.base_freq:.1f} D{self.damping} S{self.best_shaper}"
         )
 
         # Add the box behind the text
@@ -329,7 +446,55 @@ class InputShapingAnalyzer:
     def get_recommendation(self) -> str:
         """Generates a recommendation string for the best input shaper."""
 
-        return f"M593 F{self.base_freq:.1f} D{self.damping} S{self.best_shaper}"
+        return f"M593 {self.axis} F{self.base_freq:.1f} D{self.damping} S{self.best_shaper}"
+
+    def get_klipper_recommendation(self) -> str:
+        """Return a Klipper-style SET_INPUT_SHAPER command."""
+
+        return (
+            f"SET_INPUT_SHAPER SHAPER={self.best_shaper} "
+            f"FREQ={self.base_freq:.2f} "
+            f"DAMPING={self.damping:.2f}"
+        )
+
+    def build_summary(self) -> dict:
+        """Build a Klipper-style summary of all shapers."""
+
+        shaper_rows = sorted(
+            [
+                {
+                    "name": name,
+                    "residual_ratio": float(result["residual_ratio"]),
+                    "reduction_db": float(result["reduction_db"]),
+                    "peak_reduction_db": float(result["peak_reduction_db"]),
+                    "residual_energy": float(result["residual_energy"]),
+                    "accel": float(result["accel"]),
+                }
+                for name, result in self.shaper_results.items()
+            ],
+            key=lambda row: row["reduction_db"],
+            reverse=True,
+        )
+
+        return {
+            "axis": self.axis,
+            "base_freq": float(self.base_freq),
+            "secondary_freqs": [float(freq) for freq in self.secondary_freqs],
+            "freq_limits": [float(self.freq_min), float(self.freq_max)],
+            "freq_window": float(self.freq_window),
+            "band_energy": float(self.band_energy),
+            "shapers": shaper_rows,
+            "marlin_command": self.get_recommendation(),
+            "klipper_command": self.get_klipper_recommendation(),
+        }
+
+    def export_summary(self, output_path: str) -> str:
+        """Export the summary to a JSON file."""
+
+        data = self.build_summary()
+        with open(output_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+        return output_path
 
     # def get_plotly_data(self):
     #     data = {
@@ -365,10 +530,19 @@ class InputShapingAnalyzer:
                 name: {
                     "psd": [float(p) for p in result["psd"]],
                     "vibr": round(float(result["vibr"]), 3),
+                    "reduction_db": round(float(result["reduction_db"]), 2),
+                    "peak_reduction_db": round(float(result["peak_reduction_db"]), 2),
+                    "residual_ratio": round(float(result["residual_ratio"]), 4),
                     "accel": round(float(result["accel"]), 2),
                 }
                 for name, result in self.shaper_results.items()
             },
             "base_freq": round(float(self.base_freq), 2),
-            "best_shaper": str(self.best_shaper)
+            "secondary_freqs": [round(float(freq), 2) for freq in self.secondary_freqs],
+            "freq_limits": [float(self.freq_min), float(self.freq_max)],
+            "freq_window": float(self.freq_window),
+            "band_energy": float(self.band_energy),
+            "best_shaper": str(self.best_shaper),
+            "marlin_cmd": self.get_recommendation(),
+            "klipper_cmd": self.get_klipper_recommendation(),
         }

@@ -106,6 +106,8 @@ $(function () {
     self.psdImgUrl = ko.observable("");
     self.csvFileUrl = ko.observable("");
     self.recommendedCommand = ko.observable("");
+    self.klipperCommand = ko.observable("");
+    self.summaryJsonUrl = ko.observable("");
 
     self.runAccTest = function () {
       self.error("");
@@ -423,6 +425,20 @@ $(function () {
         Plotly.purge('plot_signal');
         Plotly.purge('plot_psd');
     
+        const freqLimits = data.freq_limits || null;
+        const freqRangeMin = freqLimits ? Math.max(0, freqLimits[0] - 5) : 0;
+        const freqRangeMax = freqLimits ? freqLimits[1] * 1.1 : 200;
+        const baseFreq = data.base_freq || null;
+        const secondaryFreqs = Array.isArray(data.secondary_freqs) ? data.secondary_freqs : [];
+
+        const arrayMax = (arr) => {
+          let max = -Infinity;
+          for (let i = 0; i < arr.length; i++) {
+            if (arr[i] > max) max = arr[i];
+          }
+          return max;
+        };
+
         // === SIGNAL GRAPH ===
         const traceRaw = {
           x: data.time,
@@ -460,7 +476,9 @@ $(function () {
           }
         ];
     
-        for (const [name, shaper] of Object.entries(data.shapers)) {
+        const shaperEntries = data.shapers ? Object.entries(data.shapers) : [];
+
+        for (const [name, shaper] of shaperEntries) {
           psdTraces.push({
             x: data.freqs,
             y: shaper.psd,
@@ -472,10 +490,42 @@ $(function () {
     
         const layoutPSD = {
           title: `PSD + Input Shapers (Axis ${data.axis})`,
-          xaxis: { title: 'Frequency (Hz)', range: [0, 200] },
+          xaxis: { title: 'Frequency (Hz)', range: [freqRangeMin, freqRangeMax], autorange: false },
           yaxis: { title: 'Power Spectral Density' },
           margin: { t: 40 }
         };
+
+        let globalMax = arrayMax(data.psd_original);
+        for (const [, shaper] of shaperEntries) {
+          globalMax = Math.max(globalMax, arrayMax(shaper.psd));
+        }
+
+        const shapes = [];
+        if (baseFreq) {
+          shapes.push({
+            type: 'line',
+            x0: baseFreq,
+            x1: baseFreq,
+            y0: 0,
+            y1: globalMax,
+            line: { color: '#ff7f0e', width: 2, dash: 'dot' }
+          });
+        }
+
+        secondaryFreqs.forEach((freq) => {
+          shapes.push({
+            type: 'line',
+            x0: freq,
+            x1: freq,
+            y0: 0,
+            y1: globalMax * 0.85,
+            line: { color: '#6c757d', width: 1, dash: 'dash' }
+          });
+        });
+
+        if (shapes.length) {
+          layoutPSD.shapes = shapes;
+        }
     
         Plotly.newPlot('plot_psd', psdTraces, layoutPSD, { responsive: true });
       }
@@ -510,16 +560,45 @@ $(function () {
 
       if (data.results) {
         const table = [];
+        const baseFreqLabel = data.base_freq ? parseFloat(data.base_freq).toFixed(2) : "—";
         for (let name in data.results) {
+          const result = data.results[name] || {};
+          const vibrationVal = result.vibr !== undefined ? parseFloat(result.vibr) : null;
+          const vibration = vibrationVal !== null && isFinite(vibrationVal)
+            ? vibrationVal.toExponential(2)
+            : "—";
+          const accelVal = result.accel !== undefined ? parseFloat(result.accel) : null;
+          const accel = accelVal !== null && isFinite(accelVal)
+            ? accelVal.toFixed(1)
+            : "—";
+          const residualRatio = result.residual_ratio !== undefined ? parseFloat(result.residual_ratio) : null;
+          const residualPercent = residualRatio !== null && isFinite(residualRatio)
+            ? (residualRatio * 100).toFixed(1) + "%"
+            : "—";
+          const reductionDbVal = result.reduction_db !== undefined ? parseFloat(result.reduction_db) : null;
+          const reductionDb = reductionDbVal !== null && isFinite(reductionDbVal)
+            ? reductionDbVal.toFixed(1)
+            : "—";
+          const peakDbVal = result.peak_reduction_db !== undefined ? parseFloat(result.peak_reduction_db) : null;
+          const peakDb = peakDbVal !== null && isFinite(peakDbVal)
+            ? peakDbVal.toFixed(1)
+            : "—";
+
           const row = {
             name: name,
-            vibration: parseFloat(data.results[name].vibr).toExponential(2),
-            base_freq: parseFloat(data.base_freq).toFixed(2), 
-            acceleration: parseFloat(data.results[name].accel).toFixed(1),
-            isBest: name === data.best_shaper
+            vibration: vibration,
+            base_freq: baseFreqLabel,
+            acceleration: accel,
+            residual_percent: residualPercent,
+            energy_db: reductionDb,
+            peak_db: peakDb,
+            isBest: name === data.best_shaper,
+            sort_score: reductionDbVal !== null && isFinite(reductionDbVal) ? reductionDbVal : -Infinity
           };
           table.push(row);
         }
+        table.sort((a, b) => b.sort_score - a.sort_score);
+        table.forEach((row) => delete row.sort_score);
         self.shaperResults(table);
       }
 
@@ -533,7 +612,19 @@ $(function () {
         const csvName = data.csv_path.split("/").pop();
         self.csvFileUrl(plotsBase + csvName);
 
-        self.recommendedCommand(data.command);
+        const summaryName = data.summary_path ? data.summary_path.split("/").pop() : null;
+        if (summaryName) {
+          self.summaryJsonUrl(plotsBase + summaryName);
+        }
+
+        const marlinCmd = data.marlin_cmd || data.command;
+        if (marlinCmd) {
+          self.recommendedCommand(marlinCmd);
+        }
+        if (data.klipper_cmd) {
+          self.klipperCommand(data.klipper_cmd);
+        }
+
         self.showResults(true);
       }
 

@@ -323,16 +323,22 @@
         <thead class="table-dark text-center">
           <tr>
             <th>Shaper</th>
-            <th>Vibration (PSD Area)</th>
+            <th>PSD Area (band)</th>
+            <th>Residual (%)</th>
+            <th>Energy Δ (dB)</th>
+            <th>Peak Δ (dB)</th>
             <th>Freq (Hz)</th>
             <th>Max Acceleration (mm/s²)</th>
             <th>Recommended</th>
           </tr>
         </thead>
         <tbody data-bind="foreach: shaperResults">
-          <tr>
+          <tr data-bind="css: { 'table-success': isBest }">
             <td data-bind="attr: { title: $root.getShaperTooltip(name) }, text: name"></td>
             <td data-bind="text: vibration"></td>
+            <td data-bind="text: residual_percent"></td>
+            <td data-bind="text: energy_db"></td>
+            <td data-bind="text: peak_db"></td>
             <td data-bind="text: base_freq"></td>
             <td data-bind="text: acceleration"></td>
             <td class="text-center">
@@ -355,6 +361,21 @@
         <button class="btn btn-outline-warning btn-modern" data-bind="click: sendDampingGcode">
           <i class="fas fa-sliders-h"></i> Set Damping for <span data-bind="text: bestShaperAxis"></span>
         </button>
+        <div class="mt-3">
+          <p class="mb-1">
+            <strong>Marlin:</strong>
+            <code data-bind="text: recommendedCommand"></code>
+          </p>
+          <p class="mb-1" data-bind="visible: klipperCommand">
+            <strong>Klipper:</strong>
+            <code data-bind="text: klipperCommand"></code>
+          </p>
+          <p class="mb-0" data-bind="visible: summaryJsonUrl">
+            <a class="link-light" data-bind="attr: { href: summaryJsonUrl }" download>
+              <i class="fas fa-file-download"></i> Download summary JSON
+            </a>
+          </p>
+        </div>
       </div>
     </div>
 

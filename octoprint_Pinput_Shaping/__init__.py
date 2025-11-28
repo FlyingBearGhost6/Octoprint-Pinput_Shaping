@@ -61,6 +61,17 @@ class PinputShapingPlugin(octoprint.plugin.StartupPlugin,
 
         self._plugin_logger = logging.getLogger("octoprint.plugins.Pinput_Shaping")
 
+    def _get_frequency_bounds(self):
+        """Return sanitized frequency bounds from settings."""
+
+        freq_start = float(self._settings.get(["freqStart"]))
+        freq_end = float(self._settings.get(["freqEnd"]))
+        freq_min = max(1.0, min(freq_start, freq_end))
+        freq_max = max(freq_start, freq_end)
+        if freq_max <= freq_min:
+            freq_max = freq_min + 1.0
+        return freq_min, freq_max
+
     def configure_logger(self) -> None:
         """Configure the plugin logger."""
 
@@ -294,6 +305,7 @@ class PinputShapingPlugin(octoprint.plugin.StartupPlugin,
         """Run the axis test for the specified axis."""
 
         self._plugin_logger.info(f">>>>>> Running Sweeping {axis} test")
+        freq_min, freq_max = self._get_frequency_bounds()
         # create variable with the value of datetime in iso format
         dt = time.strftime("%Y%m%dT%H%M%S")
         self.csv_filename = os.path.join(
@@ -309,7 +321,7 @@ class PinputShapingPlugin(octoprint.plugin.StartupPlugin,
             y = float(self._settings.get(["sizeY"])) / 2
             z = 10  # Default Z height for parking
             self.home_and_park(x, y, z)
-            self._printer.commands(self.test_sweep(axis))
+            self._printer.commands(self.test_sweep(axis, freq_min, freq_max))
             return {
                 "success": True,
                 "summary": f"Test for {axis} triggered successfully."
@@ -329,7 +341,8 @@ class PinputShapingPlugin(octoprint.plugin.StartupPlugin,
         """Run the resonance test for the specified axis at given coordinates."""
 
         self._plugin_logger.info(f"Running resonance test for {axis} axis at position ({x}, {y}, {z})")
-         #create variable with the value of datetime in iso format
+        freq_min, freq_max = self._get_frequency_bounds()
+        # create variable with the value of datetime in iso format
         dt= time.strftime("%Y%m%dT%H%M%S")
         self.csv_filename = os.path.join(self.metadata_dir, f"Raw_accel_values_AXIS_{axis}_{dt}.csv")
 
@@ -343,7 +356,7 @@ class PinputShapingPlugin(octoprint.plugin.StartupPlugin,
             time.sleep(2)
             self._plugin_logger.info("Sending resonance test commands to printer...")
             self.home_and_park(x, y, z)
-            self._printer.commands(self.precompute_sweep(axis, x, y))
+            self._printer.commands(self.precompute_sweep(axis, x, y, freq_min, freq_max))
             return {
                 "success": True,
                 "summary": f"Resonance test for {axis} triggered successfully."
@@ -360,14 +373,31 @@ class PinputShapingPlugin(octoprint.plugin.StartupPlugin,
         self._plugin_logger.warning(message)
         return {"success": False, "error": message}
 
-    def test_sweep(self, axis) -> list:
+    def test_sweep(self, axis, freq_min, freq_max) -> list:
         """Precompute the sweep commands for the specified axis."""
 
         self.currentAxis = axis
-        self._plugin_logger.info(f"Precomputing sweep commands for Axis {axis}...")
-        t = np.linspace(0, self.DURATION, num=2000)  # 2000 points over 20 seconds
-        freqs = self.FREQ_START + (self.FREQ_END - self.FREQ_START) * t / self.DURATION
-        positions = self.START_POS + self.AMPLITUDE * np.sin(2 * np.pi * freqs * t)
+        self._plugin_logger.info(
+            f"Precomputing sweep commands for Axis {axis} with freq range {freq_min}-{freq_max}Hz"
+        )
+        num_points = 2000
+        t = np.linspace(0, self.DURATION, num=num_points)
+        dt = self.DURATION / max(1, num_points - 1)
+        freq_min = max(freq_min, 0.1)
+        freq_max = max(freq_max, freq_min + 0.01)
+        log_span = np.log(freq_max / freq_min)
+        if abs(log_span) < 1e-6:
+            freqs = np.full_like(t, freq_min)
+        else:
+            freqs = freq_min * np.exp((log_span / self.DURATION) * t)
+
+        phase = 2 * np.pi * np.cumsum(freqs) * dt
+        amp_scale = np.sqrt(freq_min / np.maximum(freqs, freq_min))
+        min_amp = max(0.2, self.AMPLITUDE * 0.3)
+        amp_profile = np.clip(self.AMPLITUDE * amp_scale, min_amp, self.AMPLITUDE)
+        block = max(10, num_points // 20)
+        direction = np.where(((np.arange(num_points) // block) % 2) == 0, 1.0, -1.0)
+        positions = self.START_POS + direction * amp_profile * np.sin(phase)
         commands = []
         commands.append(f"M117 Testing Sweep on {axis}-Axis")
         for pos in positions:
@@ -378,25 +408,31 @@ class PinputShapingPlugin(octoprint.plugin.StartupPlugin,
 
         return commands
 
-    def precompute_sweep(self, axis, x, y) -> list:
+    def precompute_sweep(self, axis, x, y, freq_min, freq_max) -> list:
         """Precompute the resonance test commands for the specified axis."""
 
         num_cycles = 800
         steps_per_cycle = 4
 
-        amplitude = 5
-        min_amp = 1
+        base_amp = 5
+        min_amp = 0.6
         self.currentAxis = axis
 
         accel_min = int(self._settings.get(["accelMin"]))
         accel_max = int(self._settings.get(["accelMax"]))
-        # freq_start = float(self._settings.get(["freqStart"]))
-        # freq_end = float(self._settings.get(["freqEnd"]))
+        freq_min = max(freq_min, 0.1)
+        freq_max = max(freq_max, freq_min + 0.01)
+        log_span = np.log(freq_max / freq_min)
+        if abs(log_span) < 1e-6:
+            freqs = np.full(num_cycles, freq_min)
+        else:
+            freqs = freq_min * np.exp(
+                (log_span) * np.linspace(0, 1, num_cycles)
+            )
 
-        # freqs = np.linspace(freq_start, freq_end, num_cycles)
-        amplitudes = np.linspace(amplitude, min_amp, num_cycles)
+        amp_scale = np.sqrt(freq_min / np.maximum(freqs, freq_min))
+        amplitudes = np.clip(base_amp * amp_scale, min_amp, base_amp)
         accelerations = np.linspace(accel_min, accel_max, num_cycles)
-        feedrates = np.clip(100 * accelerations, 2000, 15000)
 
         commands = []
         commands.append("M117 Starting resonance test")
@@ -408,10 +444,12 @@ class PinputShapingPlugin(octoprint.plugin.StartupPlugin,
         commands.append(f"M204 S{current_accel}")
 
         for i in range(num_cycles):
-            # freq = freqs[i]
-            amp = amplitudes[i]
+            amp = max(amplitudes[i], min_amp)
             accel = int(accelerations[i])
-            feed = int(feedrates[i])
+            freq = max(freqs[i], 0.5)
+            feed_from_freq = 2 * np.pi * freq * amp * 60  # convert mm/s to mm/min
+            feed_from_accel = np.clip(100 * accel, 2000, 15000)
+            feed = int(np.clip(min(feed_from_freq, feed_from_accel), 500, 20000))
 
             # if int(freq) % 10 == 0:
             #    commands.append(f"M117 {axis} {int(freq)}Hz /{accel}mm/s²")
@@ -422,7 +460,8 @@ class PinputShapingPlugin(octoprint.plugin.StartupPlugin,
 
             for j in range(steps_per_cycle):
                 phase = 2 * np.pi * j / steps_per_cycle
-                offset = amp * np.sin(phase)
+                direction = 1 if (i + j) % 2 == 0 else -1
+                offset = direction * amp * np.sin(phase)
 
                 if axis == "X":
                     commands.append(f"G0 X{x + offset:.3f} Y{y:.3f} F{feed}")
@@ -566,18 +605,30 @@ class PinputShapingPlugin(octoprint.plugin.StartupPlugin,
             )
             return {"success": False, "error": "CSV data file not found"}
 
+        freq_min, freq_max = self._get_frequency_bounds()
+        freq_window = max(3.0, (freq_max - freq_min) * 0.08)
+
         analyzer = InputShapingAnalyzer(
             self.graphs_dir,
             self.csv_filename,
             float(self._settings.get(["dampingRatio"])),
             100,
             self.currentAxis,
+            freq_min=freq_min,
+            freq_max=freq_max,
+            freq_window=freq_window,
             logger=self._plugin_logger,
         )
         best_shaper = analyzer.analyze()
         signal_path, psd_path, shaper_results, best_shaper, base_freq = analyzer.generate_graphs()
         command = analyzer.get_recommendation()
         data_for_plotly = analyzer.get_plotly_data()
+        summary_data = analyzer.build_summary()
+        summary_basename = (
+            os.path.splitext(os.path.basename(self.csv_filename))[0] + "_summary.json"
+        )
+        summary_path = os.path.join(self.graphs_dir, summary_basename)
+        analyzer.export_summary(summary_path)
 
         self._plugin_logger.info(f"Best shaper for {self.currentAxis} axis: {best_shaper}")
         self._plugin_logger.info(f"Signal graph saved to: {signal_path}")
@@ -594,11 +645,18 @@ class PinputShapingPlugin(octoprint.plugin.StartupPlugin,
             "signal_path": str(signal_path),
             "psd_path": str(psd_path),
             "command": str(command),
+            "klipper_cmd": str(summary_data["klipper_command"]),
+            "marlin_cmd": str(summary_data["marlin_command"]),
             "csv_path": str(self.csv_filename),
+            "summary_path": str(summary_path),
+            "secondary_freqs": summary_data["secondary_freqs"],
             "results": {
                 k: {
                     "vibr": float(v["vibr"]),
                     "accel": float(v["accel"]),
+                    "reduction_db": float(v["reduction_db"]),
+                    "peak_reduction_db": float(v["peak_reduction_db"]),
+                    "residual_ratio": float(v["residual_ratio"]),
                 } for k, v in shaper_results.items()
             },
             "base_freq": float(base_freq)
@@ -607,7 +665,8 @@ class PinputShapingPlugin(octoprint.plugin.StartupPlugin,
         data_for_plotly.update({
             "type": "plotly_data",
             "description": "Input Shaping Plotly Data",
-            "axis": self.currentAxis.upper()
+            "axis": self.currentAxis.upper(),
+            "summary": summary_data,
         })
         # self._plugin_logger.info(f"Sending plotly data to frontend: {json.dumps(data_for_plotly)}")
         self._plugin_manager.send_plugin_message(self._identifier, data_for_plotly)
