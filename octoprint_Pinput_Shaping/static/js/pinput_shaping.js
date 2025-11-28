@@ -90,6 +90,8 @@ $(function () {
     self.getShaperTooltip = function(name) {
       const tooltips = {
         ZV: "Zero Vibration – Simple and quick shaper",
+        ZVD: "Zero Vibration Derivative – Adds robustness to freq errors",
+        ZVDD: "Zero Vibration Double Derivative – Further suppresses residuals",
         MZV: "Modified ZV – Better vibration suppression",
         EI: "Extra Insensitive – Good for noisy systems",
         "2HUMP_EI": "Extended EI with stronger suppression",

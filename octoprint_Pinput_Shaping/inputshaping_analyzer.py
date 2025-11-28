@@ -109,6 +109,23 @@ class InputShapingAnalyzer:
         # Zero Vibration (ZV)
         shapers["ZV"] = [(0, 1 / (1 + K)), (t, K / (1 + K))]
 
+        # Zero Vibration Derivative (ZVD)
+        denom_zvd = 1 + 2 * K + K**2
+        shapers["ZVD"] = [
+            (0, 1 / denom_zvd),
+            (t, 2 * K / denom_zvd),
+            (2 * t, K**2 / denom_zvd),
+        ]
+
+        # Zero Vibration Double Derivative (ZVDD)
+        denom_zvdd = 1 + 3 * K + 3 * K**2 + K**3
+        shapers["ZVDD"] = [
+            (0, 1 / denom_zvdd),
+            (t, 3 * K / denom_zvdd),
+            (2 * t, 3 * K**2 / denom_zvdd),
+            (3 * t, K**3 / denom_zvdd),
+        ]
+
         # Modified ZV (MFA)
         shapers["MZV"] = [
             (0,   1 / (1 + K + K**2)),
